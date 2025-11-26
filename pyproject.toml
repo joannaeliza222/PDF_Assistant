@@ -4,5 +4,12 @@ version = "0.1.0"
 description = "Add your description here"
 requires-python = ">=3.11"
 dependencies = [
+    "google-genai>=1.52.0",
+    "pdf2image>=1.17.0",
+    "pillow>=12.0.0",
+    "psycopg2-binary>=2.9.11",
+    "pypdf2>=3.0.1",
+    "pytesseract>=0.3.13",
+    "sqlalchemy>=2.0.44",
     "streamlit>=1.51.0",
 ]
