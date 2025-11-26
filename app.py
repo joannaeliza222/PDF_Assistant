@@ -1,8 +1,10 @@
 import streamlit as st
+import json
 from datetime import datetime
-from models import init_db, SessionLocal, Document, ChatHistory
+from models import init_db, SessionLocal, Document, ChatHistory, Tag, document_tags
 from pdf_processor import extract_text_from_pdf, get_pdf_info
 from gemini_ai import answer_question, summarize_document, is_api_configured
+from pdf_viewer import get_pdf_page_as_image, get_pdf_page_count
 
 st.set_page_config(
     page_title="PDF Document Assistant",
@@ -154,6 +156,16 @@ st.markdown("""
         font-weight: 500;
     }
     
+    .tag-badge {
+        display: inline-block;
+        padding: 0.2rem 0.5rem;
+        border-radius: 999px;
+        font-size: 0.7rem;
+        font-weight: 500;
+        margin-right: 0.25rem;
+        margin-top: 0.25rem;
+    }
+    
     .stButton > button {
         background: linear-gradient(135deg, #6366F1 0%, #8B5CF6 100%);
         color: white;
@@ -195,6 +207,32 @@ st.markdown("""
         -webkit-text-fill-color: transparent;
         background-clip: text;
     }
+    
+    .pdf-viewer-container {
+        background: #FFFFFF;
+        border: 1px solid #E2E8F0;
+        border-radius: 12px;
+        padding: 1rem;
+        text-align: center;
+    }
+    
+    .pdf-navigation {
+        display: flex;
+        justify-content: center;
+        align-items: center;
+        gap: 1rem;
+        margin-top: 1rem;
+    }
+    
+    .search-highlight {
+        background-color: #FEF08A;
+        padding: 0.1rem 0.2rem;
+        border-radius: 2px;
+    }
+    
+    .category-select {
+        margin-top: 0.5rem;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -206,6 +244,16 @@ if "selected_document" not in st.session_state:
     st.session_state.selected_document = None
 if "all_documents_mode" not in st.session_state:
     st.session_state.all_documents_mode = False
+if "current_page" not in st.session_state:
+    st.session_state.current_page = 1
+if "view_mode" not in st.session_state:
+    st.session_state.view_mode = "chat"
+if "zoom_level" not in st.session_state:
+    st.session_state.zoom_level = 100
+if "search_query" not in st.session_state:
+    st.session_state.search_query = ""
+if "compare_docs" not in st.session_state:
+    st.session_state.compare_docs = []
 
 
 def get_all_documents():
@@ -273,6 +321,107 @@ def save_chat_history(document_id, question, answer):
         db.close()
 
 
+def get_chat_history(document_id=None):
+    db = SessionLocal()
+    try:
+        if document_id:
+            history = db.query(ChatHistory).filter(ChatHistory.document_id == document_id).order_by(ChatHistory.timestamp.desc()).all()
+        else:
+            history = db.query(ChatHistory).order_by(ChatHistory.timestamp.desc()).all()
+        return history
+    finally:
+        db.close()
+
+
+def get_all_tags():
+    db = SessionLocal()
+    try:
+        tags = db.query(Tag).all()
+        return tags
+    finally:
+        db.close()
+
+
+def create_tag(name, color="#6366F1"):
+    db = SessionLocal()
+    try:
+        existing = db.query(Tag).filter(Tag.name == name).first()
+        if existing:
+            return existing.id
+        tag = Tag(name=name, color=color)
+        db.add(tag)
+        db.commit()
+        db.refresh(tag)
+        return tag.id
+    finally:
+        db.close()
+
+
+def add_tag_to_document(doc_id, tag_id):
+    db = SessionLocal()
+    try:
+        document = db.query(Document).filter(Document.id == doc_id).first()
+        tag = db.query(Tag).filter(Tag.id == tag_id).first()
+        if document and tag:
+            if tag not in document.tags:
+                document.tags.append(tag)
+                db.commit()
+            return True
+        return False
+    finally:
+        db.close()
+
+
+def remove_tag_from_document(doc_id, tag_id):
+    db = SessionLocal()
+    try:
+        document = db.query(Document).filter(Document.id == doc_id).first()
+        tag = db.query(Tag).filter(Tag.id == tag_id).first()
+        if document and tag and tag in document.tags:
+            document.tags.remove(tag)
+            db.commit()
+            return True
+        return False
+    finally:
+        db.close()
+
+
+def get_document_tags(doc_id):
+    db = SessionLocal()
+    try:
+        document = db.query(Document).filter(Document.id == doc_id).first()
+        if document:
+            return list(document.tags)
+        return []
+    finally:
+        db.close()
+
+
+def update_document_category(doc_id, category):
+    db = SessionLocal()
+    try:
+        document = db.query(Document).filter(Document.id == doc_id).first()
+        if document:
+            document.category = category
+            db.commit()
+            return True
+        return False
+    finally:
+        db.close()
+
+
+def search_documents(query):
+    db = SessionLocal()
+    try:
+        documents = db.query(Document).filter(
+            Document.extracted_text.ilike(f"%{query}%") | 
+            Document.filename.ilike(f"%{query}%")
+        ).all()
+        return documents
+    finally:
+        db.close()
+
+
 def format_file_size(size_bytes):
     if size_bytes < 1024:
         return f"{size_bytes} B"
@@ -282,11 +431,117 @@ def format_file_size(size_bytes):
         return f"{size_bytes / (1024 * 1024):.1f} MB"
 
 
+def highlight_text(text, query):
+    if not query or not text:
+        return text
+    import re
+    pattern = re.compile(re.escape(query), re.IGNORECASE)
+    return pattern.sub(f'<span class="search-highlight">{query}</span>', text)
+
+
+def export_chat_history(document_id=None, format_type="json"):
+    history = get_chat_history(document_id)
+    
+    if format_type == "json":
+        data = []
+        for chat in history:
+            doc = get_document_by_id(chat.document_id) if chat.document_id else None
+            data.append({
+                "document": doc.filename if doc else "All Documents",
+                "question": chat.question,
+                "answer": chat.answer,
+                "timestamp": chat.timestamp.isoformat()
+            })
+        return json.dumps(data, indent=2)
+    else:
+        lines = []
+        for chat in history:
+            doc = get_document_by_id(chat.document_id) if chat.document_id else None
+            lines.append(f"Document: {doc.filename if doc else 'All Documents'}")
+            lines.append(f"Time: {chat.timestamp.strftime('%Y-%m-%d %H:%M:%S')}")
+            lines.append(f"Q: {chat.question}")
+            lines.append(f"A: {chat.answer}")
+            lines.append("-" * 50)
+        return "\n".join(lines)
+
+
 st.markdown('<h1 style="text-align: center;">📄 <span class="header-gradient">PDF Document Assistant</span></h1>', unsafe_allow_html=True)
 st.markdown('<p style="text-align: center; color: #64748B; margin-bottom: 2rem;">Upload PDFs and ask questions about your documents using AI</p>', unsafe_allow_html=True)
 
 if not is_api_configured():
     st.warning("⚠️ AI features are disabled. Please configure your GEMINI_API_KEY in the Secrets tab to enable AI-powered Q&A.")
+
+with st.sidebar:
+    st.markdown("### 🔍 Search Documents")
+    search_query = st.text_input("Search in documents...", value=st.session_state.search_query, key="search_input")
+    if search_query != st.session_state.search_query:
+        st.session_state.search_query = search_query
+    
+    st.markdown("---")
+    
+    st.markdown("### 🏷️ Tags & Categories")
+    
+    all_tags = get_all_tags()
+    if all_tags:
+        st.markdown("**Existing Tags:**")
+        for tag in all_tags:
+            st.markdown(f'<span class="tag-badge" style="background-color: {tag.color}; color: white;">{tag.name}</span>', unsafe_allow_html=True)
+    
+    with st.expander("➕ Create New Tag"):
+        new_tag_name = st.text_input("Tag name", key="new_tag_name")
+        tag_colors = ["#6366F1", "#8B5CF6", "#10B981", "#F59E0B", "#EF4444", "#06B6D4", "#EC4899"]
+        new_tag_color = st.selectbox("Tag color", tag_colors, format_func=lambda x: f"● {x}")
+        if st.button("Create Tag"):
+            if new_tag_name:
+                create_tag(new_tag_name, new_tag_color)
+                st.success(f"Tag '{new_tag_name}' created!")
+                st.rerun()
+    
+    st.markdown("---")
+    
+    st.markdown("### 📊 Compare Documents")
+    documents = get_all_documents()
+    if len(documents) >= 2:
+        doc_options = {doc.id: doc.filename for doc in documents}
+        selected_for_compare = st.multiselect(
+            "Select documents to compare",
+            options=list(doc_options.keys()),
+            format_func=lambda x: doc_options[x],
+            max_selections=3
+        )
+        st.session_state.compare_docs = selected_for_compare
+        
+        if len(selected_for_compare) >= 2:
+            if st.button("🔄 Compare Selected"):
+                st.session_state.view_mode = "compare"
+                st.session_state.all_documents_mode = False
+                st.rerun()
+    
+    st.markdown("---")
+    
+    st.markdown("### 📤 Export")
+    if st.button("Export Chat History (JSON)"):
+        export_data = export_chat_history(format_type="json")
+        st.download_button(
+            label="Download JSON",
+            data=export_data,
+            file_name=f"chat_history_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
+            mime="application/json"
+        )
+    
+    if st.button("Export Chat History (Text)"):
+        export_data = export_chat_history(format_type="text")
+        st.download_button(
+            label="Download Text",
+            data=export_data,
+            file_name=f"chat_history_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
+            mime="text/plain"
+        )
+
+if st.session_state.search_query:
+    documents = search_documents(st.session_state.search_query)
+else:
+    documents = get_all_documents()
 
 left_col, right_col = st.columns([1, 1.5], gap="large")
 
@@ -321,6 +576,7 @@ with left_col:
                     )
                     
                     st.session_state.selected_document = doc_id
+                    st.session_state.current_page = 1
                     
                     if is_scanned:
                         st.success(f"✅ Scanned PDF uploaded successfully! Extracted text using OCR.")
@@ -337,7 +593,8 @@ with left_col:
     st.markdown("---")
     st.markdown("### 📚 Document Library")
     
-    documents = get_all_documents()
+    if st.session_state.search_query:
+        st.markdown(f"*Showing results for: \"{st.session_state.search_query}\"*")
     
     if documents:
         col1, col2, col3 = st.columns(3)
@@ -366,12 +623,20 @@ with left_col:
             with col_doc:
                 badge = '<span class="scanned-badge">OCR</span>' if doc.is_scanned else '<span class="success-badge">Text</span>'
                 
+                doc_tags = get_document_tags(doc.id)
+                tags_html = ""
+                for tag in doc_tags:
+                    tags_html += f'<span class="tag-badge" style="background-color: {tag.color}; color: white;">{tag.name}</span>'
+                
+                category_text = f" • {doc.category}" if doc.category else ""
+                
                 card_class = "document-card selected" if is_selected else "document-card"
                 
                 st.markdown(f'''
                 <div class="{card_class}">
                     <div class="document-title">📄 {doc.filename} {badge}</div>
-                    <div class="document-meta">{doc.page_count} pages • {format_file_size(doc.file_size)} • {doc.upload_date.strftime("%b %d, %Y")}</div>
+                    <div class="document-meta">{doc.page_count} pages • {format_file_size(doc.file_size)} • {doc.upload_date.strftime("%b %d, %Y")}{category_text}</div>
+                    <div>{tags_html}</div>
                 </div>
                 ''', unsafe_allow_html=True)
                 
@@ -379,6 +644,8 @@ with left_col:
                     st.session_state.selected_document = doc.id
                     st.session_state.all_documents_mode = False
                     st.session_state.messages = []
+                    st.session_state.current_page = 1
+                    st.session_state.view_mode = "chat"
                     st.rerun()
             
             with col_delete:
@@ -389,54 +656,287 @@ with left_col:
                             st.session_state.messages = []
                         st.rerun()
     else:
-        st.info("No documents uploaded yet. Upload your first PDF to get started!")
+        if st.session_state.search_query:
+            st.info("No documents match your search query.")
+        else:
+            st.info("No documents uploaded yet. Upload your first PDF to get started!")
 
 with right_col:
-    st.markdown("### 💬 Chat with Documents")
-    
-    if st.session_state.all_documents_mode:
-        st.markdown('<div style="background: #F5F3FF; padding: 0.75rem; border-radius: 8px; margin-bottom: 1rem;"><span style="color: #6366F1; font-weight: 500;">🔍 Searching across all documents</span></div>', unsafe_allow_html=True)
-        context_docs = get_all_documents()
-        combined_context = ""
-        for doc in context_docs:
-            if doc.extracted_text:
-                combined_context += f"\n\n--- Document: {doc.filename} ---\n{doc.extracted_text}"
-        document_context = combined_context
-        current_doc_name = "All Documents"
-        current_doc_id = None
-    elif st.session_state.selected_document:
-        current_doc = get_document_by_id(st.session_state.selected_document)
-        if current_doc:
-            st.markdown(f'<div style="background: #F5F3FF; padding: 0.75rem; border-radius: 8px; margin-bottom: 1rem;"><span style="color: #6366F1; font-weight: 500;">📄 Chatting with: {current_doc.filename}</span></div>', unsafe_allow_html=True)
-            document_context = current_doc.extracted_text
-            current_doc_name = current_doc.filename
-            current_doc_id = current_doc.id
-        else:
-            document_context = None
-            current_doc_name = None
-            current_doc_id = None
-    else:
-        document_context = None
-        current_doc_name = None
-        current_doc_id = None
-    
-    chat_container = st.container()
-    
-    with chat_container:
-        if st.session_state.messages:
-            for message in st.session_state.messages:
-                if message["role"] == "user":
-                    st.markdown(f'<div class="message-user">{message["content"]}</div>', unsafe_allow_html=True)
+    if st.session_state.selected_document and st.session_state.view_mode != "compare":
+        view_tabs = st.tabs(["💬 Chat", "👁️ View PDF", "🏷️ Tags & Category"])
+        
+        with view_tabs[0]:
+            st.markdown("### 💬 Chat with Documents")
+            
+            if st.session_state.all_documents_mode:
+                st.markdown('<div style="background: #F5F3FF; padding: 0.75rem; border-radius: 8px; margin-bottom: 1rem;"><span style="color: #6366F1; font-weight: 500;">🔍 Searching across all documents</span></div>', unsafe_allow_html=True)
+                context_docs = get_all_documents()
+                combined_context = ""
+                for doc in context_docs:
+                    if doc.extracted_text:
+                        combined_context += f"\n\n--- Document: {doc.filename} ---\n{doc.extracted_text}"
+                document_context = combined_context
+                current_doc_name = "All Documents"
+                current_doc_id = None
+            else:
+                current_doc = get_document_by_id(st.session_state.selected_document)
+                if current_doc:
+                    st.markdown(f'<div style="background: #F5F3FF; padding: 0.75rem; border-radius: 8px; margin-bottom: 1rem;"><span style="color: #6366F1; font-weight: 500;">📄 Chatting with: {current_doc.filename}</span></div>', unsafe_allow_html=True)
+                    document_context = current_doc.extracted_text
+                    current_doc_name = current_doc.filename
+                    current_doc_id = current_doc.id
                 else:
-                    st.markdown(f'<div class="message-assistant">{message["content"]}</div>', unsafe_allow_html=True)
-        elif document_context:
-            st.markdown("""
-            <div style="text-align: center; padding: 2rem; color: #64748B;">
-                <div style="font-size: 3rem; margin-bottom: 1rem;">💭</div>
-                <p>Ask any question about your document!</p>
-                <p style="font-size: 0.85rem;">Try: "What is this document about?" or "Summarize the key points"</p>
-            </div>
-            """, unsafe_allow_html=True)
+                    document_context = None
+                    current_doc_name = None
+                    current_doc_id = None
+            
+            chat_container = st.container()
+            
+            with chat_container:
+                if st.session_state.messages:
+                    for message in st.session_state.messages:
+                        if message["role"] == "user":
+                            st.markdown(f'<div class="message-user">{message["content"]}</div>', unsafe_allow_html=True)
+                        else:
+                            st.markdown(f'<div class="message-assistant">{message["content"]}</div>', unsafe_allow_html=True)
+                elif document_context:
+                    st.markdown("""
+                    <div style="text-align: center; padding: 2rem; color: #64748B;">
+                        <div style="font-size: 3rem; margin-bottom: 1rem;">💭</div>
+                        <p>Ask any question about your document!</p>
+                        <p style="font-size: 0.85rem;">Try: "What is this document about?" or "Summarize the key points"</p>
+                    </div>
+                    """, unsafe_allow_html=True)
+            
+            if document_context:
+                col_input, col_btn = st.columns([5, 1])
+                
+                with col_input:
+                    user_question = st.text_input(
+                        "Ask a question",
+                        placeholder="Type your question here...",
+                        key="user_input",
+                        label_visibility="collapsed"
+                    )
+                
+                with col_btn:
+                    send_button = st.button("Send", use_container_width=True)
+                
+                col_summary, col_clear = st.columns(2)
+                
+                with col_summary:
+                    if st.button("📝 Summarize Document", use_container_width=True):
+                        with st.spinner("Generating summary..."):
+                            summary = summarize_document(document_context, current_doc_name)
+                            st.session_state.messages.append({"role": "user", "content": "Summarize this document"})
+                            st.session_state.messages.append({"role": "assistant", "content": summary})
+                            if current_doc_id:
+                                save_chat_history(current_doc_id, "Summarize this document", summary)
+                            st.rerun()
+                
+                with col_clear:
+                    if st.button("🗑️ Clear Chat", use_container_width=True):
+                        st.session_state.messages = []
+                        st.rerun()
+                
+                if send_button and user_question:
+                    st.session_state.messages.append({"role": "user", "content": user_question})
+                    
+                    with st.spinner("Thinking..."):
+                        answer = answer_question(user_question, document_context, current_doc_name)
+                        st.session_state.messages.append({"role": "assistant", "content": answer})
+                        
+                        if current_doc_id:
+                            save_chat_history(current_doc_id, user_question, answer)
+                    
+                    st.rerun()
+        
+        with view_tabs[1]:
+            st.markdown("### 👁️ PDF Viewer")
+            
+            current_doc = get_document_by_id(st.session_state.selected_document)
+            if current_doc and current_doc.file_data:
+                col_nav1, col_page, col_nav2, col_zoom = st.columns([1, 2, 1, 2])
+                
+                with col_nav1:
+                    if st.button("◀ Prev", use_container_width=True):
+                        if st.session_state.current_page > 1:
+                            st.session_state.current_page -= 1
+                            st.rerun()
+                
+                with col_page:
+                    st.markdown(f"<div style='text-align: center; padding: 0.5rem;'>Page {st.session_state.current_page} of {current_doc.page_count}</div>", unsafe_allow_html=True)
+                
+                with col_nav2:
+                    if st.button("Next ▶", use_container_width=True):
+                        if st.session_state.current_page < current_doc.page_count:
+                            st.session_state.current_page += 1
+                            st.rerun()
+                
+                with col_zoom:
+                    zoom = st.select_slider("Zoom", options=[50, 75, 100, 125, 150, 200], value=st.session_state.zoom_level)
+                    if zoom != st.session_state.zoom_level:
+                        st.session_state.zoom_level = zoom
+                
+                with st.spinner("Loading page..."):
+                    dpi = int(150 * (st.session_state.zoom_level / 100))
+                    page_image = get_pdf_page_as_image(current_doc.file_data, st.session_state.current_page, dpi=dpi)
+                    
+                    if page_image:
+                        st.markdown(f'<div class="pdf-viewer-container"><img src="{page_image}" style="max-width: 100%; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.1);"></div>', unsafe_allow_html=True)
+                    else:
+                        st.error("Failed to render page. The PDF might be corrupted.")
+                
+                page_jump = st.number_input("Go to page", min_value=1, max_value=current_doc.page_count, value=st.session_state.current_page)
+                if page_jump != st.session_state.current_page:
+                    st.session_state.current_page = page_jump
+                    st.rerun()
+        
+        with view_tabs[2]:
+            st.markdown("### 🏷️ Tags & Category")
+            
+            current_doc = get_document_by_id(st.session_state.selected_document)
+            if current_doc:
+                st.markdown(f"**Document:** {current_doc.filename}")
+                
+                categories = ["", "Work", "Personal", "Research", "Legal", "Financial", "Medical", "Educational", "Other"]
+                current_category = current_doc.category if current_doc.category else ""
+                selected_category = st.selectbox("Category", categories, index=categories.index(current_category) if current_category in categories else 0)
+                
+                if selected_category != current_category:
+                    update_document_category(current_doc.id, selected_category if selected_category else None)
+                    st.success("Category updated!")
+                    st.rerun()
+                
+                st.markdown("---")
+                st.markdown("**Tags:**")
+                
+                current_tags = get_document_tags(current_doc.id)
+                all_tags = get_all_tags()
+                
+                if current_tags:
+                    for tag in current_tags:
+                        col_tag, col_remove = st.columns([4, 1])
+                        with col_tag:
+                            st.markdown(f'<span class="tag-badge" style="background-color: {tag.color}; color: white;">{tag.name}</span>', unsafe_allow_html=True)
+                        with col_remove:
+                            if st.button("✕", key=f"remove_tag_{tag.id}"):
+                                remove_tag_from_document(current_doc.id, tag.id)
+                                st.rerun()
+                else:
+                    st.info("No tags assigned to this document.")
+                
+                available_tags = [t for t in all_tags if t not in current_tags]
+                if available_tags:
+                    st.markdown("**Add Tag:**")
+                    tag_to_add = st.selectbox("Select tag", options=[None] + available_tags, format_func=lambda x: x.name if x else "Select a tag...")
+                    if tag_to_add:
+                        if st.button("Add Tag"):
+                            add_tag_to_document(current_doc.id, tag_to_add.id)
+                            st.success(f"Tag '{tag_to_add.name}' added!")
+                            st.rerun()
+    
+    elif st.session_state.view_mode == "compare" and len(st.session_state.compare_docs) >= 2:
+        st.markdown("### 📊 Document Comparison")
+        
+        compare_docs_data = [get_document_by_id(doc_id) for doc_id in st.session_state.compare_docs]
+        compare_docs_data = [d for d in compare_docs_data if d]
+        
+        if len(compare_docs_data) >= 2:
+            st.markdown(f"**Comparing {len(compare_docs_data)} documents:**")
+            for doc in compare_docs_data:
+                st.markdown(f"- {doc.filename}")
+            
+            st.markdown("---")
+            
+            if st.button("🔍 Generate Comparative Analysis", use_container_width=True):
+                combined_context = ""
+                for doc in compare_docs_data:
+                    if doc.extracted_text:
+                        combined_context += f"\n\n=== Document: {doc.filename} ===\n{doc.extracted_text[:10000]}"
+                
+                comparison_prompt = f"Compare and contrast the following documents. Identify similarities, differences, and key points from each:\n{combined_context}"
+                
+                with st.spinner("Analyzing documents..."):
+                    from gemini_ai import answer_question
+                    analysis = answer_question(
+                        "Please provide a detailed comparison of these documents. Include: 1) Key similarities 2) Main differences 3) Unique points from each document 4) Overall summary",
+                        combined_context,
+                        "Multiple Documents"
+                    )
+                    st.markdown("#### Analysis Results:")
+                    st.markdown(analysis)
+            
+            user_compare_question = st.text_input("Ask a question about these documents...", key="compare_question")
+            if st.button("Ask", key="compare_ask") and user_compare_question:
+                combined_context = ""
+                for doc in compare_docs_data:
+                    if doc.extracted_text:
+                        combined_context += f"\n\n=== Document: {doc.filename} ===\n{doc.extracted_text}"
+                
+                with st.spinner("Thinking..."):
+                    from gemini_ai import answer_question
+                    answer = answer_question(user_compare_question, combined_context, "Multiple Documents")
+                    st.markdown("#### Answer:")
+                    st.markdown(answer)
+            
+            if st.button("← Back to Chat"):
+                st.session_state.view_mode = "chat"
+                st.rerun()
+    
+    else:
+        st.markdown("### 💬 Chat with Documents")
+        
+        if st.session_state.all_documents_mode:
+            st.markdown('<div style="background: #F5F3FF; padding: 0.75rem; border-radius: 8px; margin-bottom: 1rem;"><span style="color: #6366F1; font-weight: 500;">🔍 Searching across all documents</span></div>', unsafe_allow_html=True)
+            context_docs = get_all_documents()
+            combined_context = ""
+            for doc in context_docs:
+                if doc.extracted_text:
+                    combined_context += f"\n\n--- Document: {doc.filename} ---\n{doc.extracted_text}"
+            document_context = combined_context
+            current_doc_name = "All Documents"
+            current_doc_id = None
+            
+            chat_container = st.container()
+            
+            with chat_container:
+                if st.session_state.messages:
+                    for message in st.session_state.messages:
+                        if message["role"] == "user":
+                            st.markdown(f'<div class="message-user">{message["content"]}</div>', unsafe_allow_html=True)
+                        else:
+                            st.markdown(f'<div class="message-assistant">{message["content"]}</div>', unsafe_allow_html=True)
+                elif document_context:
+                    st.markdown("""
+                    <div style="text-align: center; padding: 2rem; color: #64748B;">
+                        <div style="font-size: 3rem; margin-bottom: 1rem;">💭</div>
+                        <p>Ask any question about your documents!</p>
+                    </div>
+                    """, unsafe_allow_html=True)
+            
+            if document_context:
+                col_input, col_btn = st.columns([5, 1])
+                
+                with col_input:
+                    user_question = st.text_input(
+                        "Ask a question",
+                        placeholder="Type your question here...",
+                        key="user_input_all",
+                        label_visibility="collapsed"
+                    )
+                
+                with col_btn:
+                    send_button = st.button("Send", use_container_width=True, key="send_all")
+                
+                if send_button and user_question:
+                    st.session_state.messages.append({"role": "user", "content": user_question})
+                    
+                    with st.spinner("Thinking..."):
+                        answer = answer_question(user_question, document_context, current_doc_name)
+                        st.session_state.messages.append({"role": "assistant", "content": answer})
+                    
+                    st.rerun()
         else:
             st.markdown("""
             <div style="text-align: center; padding: 2rem; color: #64748B;">
@@ -444,49 +944,6 @@ with right_col:
                 <p>Upload a document or select one from your library to start chatting!</p>
             </div>
             """, unsafe_allow_html=True)
-    
-    if document_context:
-        col_input, col_btn = st.columns([5, 1])
-        
-        with col_input:
-            user_question = st.text_input(
-                "Ask a question",
-                placeholder="Type your question here...",
-                key="user_input",
-                label_visibility="collapsed"
-            )
-        
-        with col_btn:
-            send_button = st.button("Send", use_container_width=True)
-        
-        col_summary, col_clear = st.columns(2)
-        
-        with col_summary:
-            if st.button("📝 Summarize Document", use_container_width=True):
-                with st.spinner("Generating summary..."):
-                    summary = summarize_document(document_context, current_doc_name)
-                    st.session_state.messages.append({"role": "user", "content": "Summarize this document"})
-                    st.session_state.messages.append({"role": "assistant", "content": summary})
-                    if current_doc_id:
-                        save_chat_history(current_doc_id, "Summarize this document", summary)
-                    st.rerun()
-        
-        with col_clear:
-            if st.button("🗑️ Clear Chat", use_container_width=True):
-                st.session_state.messages = []
-                st.rerun()
-        
-        if send_button and user_question:
-            st.session_state.messages.append({"role": "user", "content": user_question})
-            
-            with st.spinner("Thinking..."):
-                answer = answer_question(user_question, document_context, current_doc_name)
-                st.session_state.messages.append({"role": "assistant", "content": answer})
-                
-                if current_doc_id:
-                    save_chat_history(current_doc_id, user_question, answer)
-            
-            st.rerun()
 
 st.markdown("---")
 st.markdown(
