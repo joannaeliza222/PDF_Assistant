@@ -2,11 +2,21 @@ import os
 from google import genai
 from google.genai import types
 
+API_KEY = os.environ.get("GEMINI_API_KEY")
+client = None
 
-client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
+if API_KEY:
+    client = genai.Client(api_key=API_KEY)
+
+
+def is_api_configured():
+    return client is not None
 
 
 def answer_question(question: str, document_context: str, document_name: str = None) -> str:
+    if not is_api_configured():
+        return "AI features are not available. Please configure your GEMINI_API_KEY to enable AI-powered Q&A."
+    
     if not document_context or document_context.strip() == "":
         return "I couldn't find any text content in the document to answer your question. The document might be empty or the text extraction failed."
     
@@ -50,6 +60,9 @@ Please provide a helpful and accurate answer based on the document content above
 
 
 def summarize_document(document_text: str, document_name: str = None) -> str:
+    if not is_api_configured():
+        return "AI features are not available. Please configure your GEMINI_API_KEY to enable document summarization."
+    
     if not document_text or document_text.strip() == "":
         return "The document appears to be empty or the text extraction failed."
     

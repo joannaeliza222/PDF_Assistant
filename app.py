@@ -2,7 +2,7 @@ import streamlit as st
 from datetime import datetime
 from models import init_db, SessionLocal, Document, ChatHistory
 from pdf_processor import extract_text_from_pdf, get_pdf_info
-from gemini_ai import answer_question, summarize_document
+from gemini_ai import answer_question, summarize_document, is_api_configured
 
 st.set_page_config(
     page_title="PDF Document Assistant",
@@ -284,6 +284,9 @@ def format_file_size(size_bytes):
 
 st.markdown('<h1 style="text-align: center;">📄 <span class="header-gradient">PDF Document Assistant</span></h1>', unsafe_allow_html=True)
 st.markdown('<p style="text-align: center; color: #64748B; margin-bottom: 2rem;">Upload PDFs and ask questions about your documents using AI</p>', unsafe_allow_html=True)
+
+if not is_api_configured():
+    st.warning("⚠️ AI features are disabled. Please configure your GEMINI_API_KEY in the Secrets tab to enable AI-powered Q&A.")
 
 left_col, right_col = st.columns([1, 1.5], gap="large")
 
