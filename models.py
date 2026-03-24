@@ -1,9 +1,12 @@
 import os
 from datetime import datetime
+
+from dotenv import load_dotenv
 from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, LargeBinary, ForeignKey, Table
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, relationship
 
+load_dotenv()
 Base = declarative_base()
 
 DATABASE_URL = os.environ.get("DATABASE_URL")

@@ -3,9 +3,11 @@ import json
 import subprocess
 import time
 import os
+from dotenv import load_dotenv
 
+load_dotenv()
 OLLAMA_HOST = "http://localhost:11434"
-MODEL_NAME = "mistral:7b"  # 7B model fits in 8GB RAM
+MODEL_NAME = "mistral:7b"
 OLLAMA_PROCESS = None
 
 
@@ -108,7 +110,7 @@ Answer:"""
                 "temperature": 0.3,
                 "num_predict": 1024
             },
-            timeout=60
+            timeout=120
         )
         
         if response.status_code == 200:
